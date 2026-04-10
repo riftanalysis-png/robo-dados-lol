@@ -10,6 +10,11 @@ const gridApiFiles = axios.create({ baseURL: 'https://api.grid.gg/file-download'
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+const CAMPEONATOS_ALVO = [
+  "lck", "lec", "lcs", "emea", "cblol", "circuito desafiante",
+  "first stand", "mundial", "world", "msi", "americas cup"
+];
+
 // --- UTILIDADES ---
 const toNum = (val) => {
   if (val === undefined || val === null || val === '') return 0;
@@ -439,13 +444,6 @@ async function processarPartidaRecente(partida) {
     }
 }
 
-// --- RADAR DE VARREDURA DO ANO (COM PAGINAÇÃO) ---
-// A LISTA BLINDADA (Coloque no topo do arquivo junto das constantes se preferir)
-const CAMPEONATOS_ALVO = [
-  "lck", "lec", "lcs", "emea", "cblol", "circuito desafiante",
-  "first stand", "mundial", "world", "msi", "americas cup"
-];
-
 // --- TRATOR CRONOLÓGICO SEGURO ---
 async function executarBackfillStreaming(tipo) {
   console.log(`\n🤖 LIGANDO TRATOR DE EXTRAÇÃO PARA: ${tipo} (Jan 2026 -> Hoje)...`);
@@ -525,5 +523,3 @@ async function iniciarBackfill() {
 }
 
 iniciarBackfill();
-
-buscarEProcessarAnoAteHoje();
