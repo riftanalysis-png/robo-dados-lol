@@ -1,0 +1,31 @@
+name: Trator de Dados Diário
+
+on:
+  schedule:
+    # Roda todos os dias às 05:00 da manhã (Horário UTC. No Brasil, serão 02:00 da madrugada)
+    - cron: '0 5 * * *'
+  # Isso permite que você rode o robô manualmente clicando em um botão no site
+  workflow_dispatch:
+
+jobs:
+  extrair_dados:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Baixar o código do repositório
+      uses: actions/checkout@v4
+
+    - name: Instalar Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20' # Mesma versão que você usa
+
+    - name: Instalar Dependências
+      run: npm install
+
+    - name: Rodar o Robô de Extração
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        GRID_API_KEY: ${{ secrets.GRID_API_KEY }}
+      run: node automacao.js
