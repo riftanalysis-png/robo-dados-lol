@@ -115,7 +115,7 @@ function extrairEstatisticasDB(jogo, detailsJson, eventLines, matchId, teamMap, 
     if (isNaN(new Date(timestamp).getTime())) timestamp = Date.now();
 
     return {
-      match_id: matchId, summoner_name: summoner, puuid: p.puuid || `${summoner}-${matchId}`, // Fallback if PUUID is missing
+      match_id: matchId, summoner_name: summoner, puuid: p.puuid || `${summoner}-${matchId}`, 
       game_start_time: new Date(timestamp).toISOString(), patch: patch, 
       team_acronym: teamMap[tId] || (tId === 100 ? "BLUE" : "RED"), side: tId === 100 ? 'Blue' : 'Red',
       lane: p.lane || p.teamPosition || p.role || "UNKNOWN", champion: p.championName,
@@ -297,85 +297,200 @@ async function baixarZIPSeguro(url, retries = 3) {
       return null;
     } catch (e) {
       const status = e.response?.status;
-      
       if (status === 429) {
-        const waitTime = (i + 1) * 3000; // Espera 3s, depois 6s, depois 9s...
+        const waitTime = (i + 1) * 3000;
         console.log(`      ↳ ⏳ Rate Limit (429). Tentativa ${i+1}/${retries}. Esperando ${waitTime/1000}s...`);
         await delay(waitTime);
-        continue; // Tenta de novo
+        continue;
       }
-      
       if (status === 404) {
-        // 404 é comum se o jogo acabou de terminar, os arquivos ainda estão sendo gerados.
-        return null; 
+          console.log(`      ↳ ⚠️ 404: Arquivo inexistente na Grid.`);
+          return null; 
       }
-
       console.log(`      ↳ ⚠️ Erro ${status || e.message} em: ${url}`);
       return null;
     }
   }
   return null;
 }
+
 async function processarPartidaRecente(partida) {
     const seriesId = String(partida.id);
     console.log(`\n⏳ Iniciando Série [${seriesId}] - ${partida.campeonato}`);
 
-    // Download 1: Riot End State
     console.log(`      ↳ Baixando: Riot End State...`);
     const zipRiot = await baixarZIPSeguro(`/end-state/riot/series/${seriesId}`);
-    if (!zipRiot) return;
-    await delay(1600); // Intervalo de segurança obrigatório
+    
+    // Freio OBRIGATÓRIO de limite de taxa independente de erro ou sucesso
+    await delay(1600); 
 
-    // Download 2: Riot Details
+    if (!zipRiot) {
+        console.log(`      ↳ ⏭️ Sem dados Riot (404/Erro). Pulando série...`);
+        return;
+    }
+
     console.log(`      ↳ Baixando: Riot Details...`);
     const zipDetails = await baixarZIPSeguro(`/end-state-details/riot/series/${seriesId}`);
     await delay(1600); 
 
-    // Download 3: Riot Events (Timeline)
     console.log(`      ↳ Baixando: Riot Events...`);
     const zipEvents = await baixarZIPSeguro(`/events/riot/series/${seriesId}`);
     await delay(1600); 
 
-    // Download 4: Grid State (Draft)
     console.log(`      ↳ Baixando: Grid End State...`);
     const zipGrid = await baixarZIPSeguro(`/end-state/grid/series/${seriesId}`);
     await delay(1600);
 
-    // ... restante da sua lógica de extração e injeção (endState, calculateRatings, etc)
+    const entradasRiot = zipRiot.getEntries();
+    
+    let gridState = null;
+    if (zipGrid && zipGrid.getEntries) {
+        const gridEntry = zipGrid.getEntries()[0];
+        if (gridEntry) gridState = JSON.parse(gridEntry.getData().toString('utf8'));
+    }
+
+    const { game_type, split } = formatTournamentDetails(partida.campeonato);
+
+    for (const entrada of entradasRiot) {
+        const matchRegex = entrada.entryName.match(/_(\d+)\.json$/);
+        if (!matchRegex) continue;
+        
+        const gameNum = matchRegex[1];
+        const realMatchId = `${seriesId}_${gameNum}`;
+
+        const { data: existe } = await supabase.from('matches').select('id').eq('id', realMatchId).maybeSingle();
+        if (existe) {
+             console.log(`⏩ Jogo ${realMatchId} já no BD. Pulando...`);
+             continue;
+        }
+
+        console.log(`▶️ Processando Jogo ${gameNum} (ID: ${realMatchId})...`);
+
+        const endState = JSON.parse(entrada.getData().toString('utf8'));
+
+        let lado_vencedor = 'unknown';
+        if (endState.teams) {
+            const winTeam = endState.teams.find(t => t.win === true || t.win === "Win");
+            if (winTeam) lado_vencedor = (winTeam.teamId || winTeam.teamID) === 100 ? 'blue' : 'red';
+        }
+
+        let detailsJson = null;
+        if (zipDetails && zipDetails.getEntries) {
+            const detEntry = zipDetails.getEntries().find(e => e.entryName.match(new RegExp(`_${gameNum}\\.json$`)));
+            if (detEntry) detailsJson = JSON.parse(detEntry.getData().toString('utf8'));
+        }
+
+        let eventLines = [];
+        if (zipEvents && zipEvents.getEntries) {
+            const evtEntry = zipEvents.getEntries().find(e => e.entryName.match(new RegExp(`_${gameNum}\\.jsonl?$`)));
+            if (evtEntry) eventLines = evtEntry.getData().toString('utf8').trim().split('\n').filter(l => l).map(l => JSON.parse(l));
+        }
+
+        const teamMap = {}; const nameMap = {};
+        const getAcronym = (tId) => {
+            const p = endState.participants.find(part => (part.teamId === tId || part.teamID === tId));
+            const nome = p ? (p.riotIdGameName || p.summonerName || (p.riotId ? p.riotId.displayName : "")) : "";
+            return (nome && nome.includes(' ')) ? nome.split(' ')[0] : (tId === 100 ? "BLUE" : "RED");
+        };
+        teamMap[100] = getAcronym(100); teamMap[200] = getAcronym(200);
+
+        endState.participants.forEach(p => { 
+            const pId = p.participantId || p.participantID;
+            nameMap[pId] = p.riotIdGameName || p.summonerName || (p.riotId ? p.riotId.displayName : "Unknown"); 
+        });
+
+        const patch = endState.gameVersion ? endState.gameVersion.split('.').slice(0,2).join('.') : "N/A";
+        let timestamp = endState.gameStartTimestamp || endState.gameCreation || Date.now();
+        if (isNaN(new Date(timestamp).getTime())) timestamp = Date.now();
+        const finalIsoDate = new Date(timestamp).toISOString();
+
+        // 1. Extrai Dados Brutos
+        const statsBrutos = extrairEstatisticasDB(endState, detailsJson, eventLines, realMatchId, teamMap, patch);
+        const wardsDB = extrairWardsDB(eventLines, realMatchId, nameMap);
+        const objetivosDB = extrairObjetivosDB(eventLines, realMatchId, teamMap, nameMap);
+        const draftsDB = extrairDraftsDB(gridState, endState, realMatchId, teamMap, parseInt(gameNum));
+
+        // 2. Extrai Times e Jogadores Únicos
+        const times = new Map();
+        const jogadores = new Map();
+        statsBrutos.forEach(s => {
+            if (s.team_acronym) times.set(s.team_acronym, { acronym: s.team_acronym, name: s.team_acronym });
+            if (s.puuid) jogadores.set(s.puuid, { puuid: s.puuid, nickname: s.summoner_name, team_acronym: s.team_acronym, primary_role: s.lane });
+        });
+        
+        await supabase.from('teams').upsert(Array.from(times.values()), { onConflict: 'acronym', ignoreDuplicates: true });
+        await supabase.from('players').upsert(Array.from(jogadores.values()), { onConflict: 'puuid', ignoreDuplicates: true });
+
+        // 3. Upsert Series e Match
+        await supabase.from('series').upsert({ id: seriesId, description: `${teamMap[100]} x ${teamMap[200]}` }, { onConflict: 'id' });
+        await supabase.from('matches').upsert({
+            id: realMatchId, series_id: seriesId, patch: patch, game_start_time: finalIsoDate, 
+            game_type: game_type, split: split, blue_team_tag: teamMap[100], red_team_tag: teamMap[200], winner_side: lado_vencedor
+        }, { onConflict: 'id' });
+
+        // 4. Calcula Ratings e Insere Dados Finais
+        const statsFinais = await calculateRatings(statsBrutos);
+        if (statsFinais.length > 0) await supabase.from('player_stats_detailed').upsert(statsFinais);
+        if (wardsDB.length > 0) await supabase.from('match_wards').insert(wardsDB);
+        if (objetivosDB.length > 0) await supabase.from('match_objectives').insert(objetivosDB);
+        if (draftsDB.length > 0) await supabase.from('match_drafts').insert(draftsDB);
+
+        console.log(`✅ Jogo ${realMatchId} injetado no Supabase com Sucesso!`);
+    }
 }
 
-// --- RADAR DIÁRIO ---
-async function buscarEProcessarUltimas24h() {
-  console.log(`\n🤖 LIGANDO RADAR DE EXTRAÇÃO DIÁRIA...`);
+// --- RADAR DE VARREDURA DO ANO (COM PAGINAÇÃO) ---
+async function buscarEProcessarAnoAteHoje() {
+  console.log(`\n🤖 LIGANDO TRATOR DE EXTRAÇÃO (DO INÍCIO DO ANO ATÉ HOJE)...`);
   
-  // Define a janela de tempo exata (de Ontem até Agora)
-  const ontem = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const inicioDoAno = "2026-01-01T00:00:00.000Z";
   const agora = new Date().toISOString(); 
   
-  const query = `
-    query {
-      allSeries(
-        first: 50, 
-        filter: { 
-          titleId: 3, 
-          startTimeScheduled: { gte: "${ontem}", lte: "${agora}" } 
-        }, 
-        orderBy: StartTimeScheduled, orderDirection: DESC
-      ) { edges { node { id, tournament { name } } } }
-    }`;
+  let hasNextPage = true;
+  let cursor = null;
+  let pagina = 1;
+  let totalProcessado = 0;
 
-  try {
-    const res = await gridApiGraphQL.post('', { query });
-    const partidas = res.data.data.allSeries.edges.map(e => ({ id: e.node.id, campeonato: e.node.tournament?.name || 'Geral' }));
-    console.log(`📡 Encontradas ${partidas.length} partidas jogadas nas últimas 24h.`);
-    
-    for (const p of partidas) {
-        const { data: existe } = await supabase.from('series').select('id').eq('id', p.id).maybeSingle();
-        if (!existe) await processarPartidaRecente(p);
-        else console.log(`⏩ Série ${p.id} já processada anteriormente.`);
+  while (hasNextPage) {
+    const query = `
+      query {
+        allSeries(
+          first: 50, 
+          ${cursor ? `after: "${cursor}",` : ""}
+          filter: { titleId: 3, startTimeScheduled: { gte: "${inicioDoAno}", lte: "${agora}" } }, 
+          orderBy: StartTimeScheduled, orderDirection: DESC
+        ) { 
+          pageInfo { hasNextPage, endCursor }
+          edges { node { id, tournament { name } } } 
+        }
+      }`;
+
+    try {
+      const res = await gridApiGraphQL.post('', { query });
+      const data = res.data.data.allSeries;
+      
+      const partidas = data.edges.map(e => ({ id: e.node.id, campeonato: e.node.tournament?.name || 'Geral' }));
+      totalProcessado += partidas.length;
+      
+      console.log(`\n📄 Lendo Página ${pagina}... (${partidas.length} partidas encontradas)`);
+      
+      for (const p of partidas) {
+          const { data: existe } = await supabase.from('series').select('id').eq('id', p.id).maybeSingle();
+          if (!existe) await processarPartidaRecente(p);
+          else console.log(`⏩ Série ${p.id} já processada. Pulando...`);
+      }
+      
+      hasNextPage = data.pageInfo.hasNextPage;
+      cursor = data.pageInfo.endCursor;
+      pagina++;
+
+    } catch (err) { 
+      console.error(`❌ Erro no Radar (Página ${pagina}):`, err.message); 
+      break;
     }
-    console.log("\n🏁 EXECUÇÃO DIÁRIA CONCLUÍDA.");
-  } catch (err) { console.error(`❌ Erro no Radar:`, err.message); }
+  }
+  
+  console.log(`\n🏁 EXECUÇÃO CONCLUÍDA. Total de séries lidas na varredura: ${totalProcessado}.`);
 }
 
-buscarEProcessarUltimas24h();
+buscarEProcessarAnoAteHoje();
