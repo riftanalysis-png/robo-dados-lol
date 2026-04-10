@@ -3,20 +3,214 @@ const axios = require('axios');
 const AdmZip = require('adm-zip');
 const { createClient } = require('@supabase/supabase-js');
 
-// Conexões
+// --- CONEXÕES ---
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const gridApiGraphQL = axios.create({ baseURL: 'https://api.grid.gg/central-data/graphql', headers: { 'x-api-key': process.env.GRID_API_KEY, 'Content-Type': 'application/json' }});
 const gridApiFiles = axios.create({ baseURL: 'https://api.grid.gg/file-download', headers: { 'x-api-key': process.env.GRID_API_KEY }});
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// --- UTILIDADES ---
 const toNum = (val) => {
   if (val === undefined || val === null || val === '') return 0;
   if (typeof val === 'number') return val;
   return parseFloat(val.toString().replace('%', '').replace(/\./g, '').replace(',', '.')) || 0;
 };
 
-// --- MOTOR DE RATINGS (Veio do seu React) ---
+function formatTournamentDetails(campeonato) {
+  const campLow = campeonato.toLowerCase();
+  if (campLow.includes("scrim")) return { game_type: "SCRIM", split: "N/A" };
+  
+  let game_type = campeonato;
+  let split = "";
+  if (campeonato.includes(" - ")) {
+    const parts = campeonato.split(" - ");
+    game_type = parts[0].trim(); 
+    let rest = parts.slice(1).join(" - ").trim();
+    if (rest.includes("(")) split = rest.split("(")[0].trim(); else split = rest;
+  } else if (campeonato.includes("(")) {
+    game_type = campeonato.split("(")[0].trim();
+  }
+  split = split.replace(/\b20\d{2}\b/g, '').replace(/\s{2,}/g, ' ').trim();
+  return { game_type, split: split || "Geral" };
+}
+
+// --- FUNÇÕES DE EXTRAÇÃO DE DADOS EM MEMÓRIA ---
+function extrairDadosPorTempo(endStateDetails, temposMinutos) {
+  const temposMs = temposMinutos.map(min => min * 60000);
+  const resultado = {};
+  if (!endStateDetails || !endStateDetails.frames) return resultado;
+  for (const tempoMs of temposMs) {
+    const frame = endStateDetails.frames.find(f => f.timestamp >= tempoMs);
+    if (!frame) continue;
+    const dados = {};
+    for (const [id, frameData] of Object.entries(frame.participantFrames)) {
+      dados[id] = { cs: (frameData.minionsKilled || 0) + (frameData.jungleMinionsKilled || 0), xp: frameData.xp || 0, gold: frameData.totalGold || 0 };
+    }
+    resultado[tempoMs / 60000] = dados;
+  }
+  return resultado;
+}
+
+function extrairEventosChave(eventLines) {
+  const resultado = {};
+  for (const evento of eventLines) {
+    const tipo = evento.eventSubType || evento.name || "";
+    const ator = evento.actorName || evento.killerName || ""; 
+    const assistentes = evento.assisters || [];
+    if (evento.eventType === "CHAMPION_KILL" && tipo === "KILL_FIRST_BLOOD") {
+      resultado[ator] = { ...resultado[ator], fbKill: true };
+      assistentes.forEach(name => { resultado[name] = { ...resultado[name], fbAssist: true }; });
+    }
+    if (evento.eventType === "BUILDING_KILL" && tipo === "KILL_FIRST_TOWER") {
+      resultado[ator] = { ...resultado[ator], ftKill: true };
+      assistentes.forEach(name => { resultado[name] = { ...resultado[name], ftAssist: true }; });
+    }
+  }
+  return resultado;
+}
+
+function extrairEstatisticasDB(jogo, detailsJson, eventLines, matchId, teamMap, patch) {
+  const eventosChave = extrairEventosChave(eventLines);
+  const dadosPorTempo = extrairDadosPorTempo(detailsJson, [6, 12, 18]); 
+  const duracaoMinutos = (jogo.gameDuration || 1) / 60;
+  const limit12 = 12 * 60 * 1000;
+  const teamStats = { 100: { dmg: 0, gold: 0, taken: 0 }, 200: { dmg: 0, gold: 0, taken: 0 } };
+  
+  jogo.participants.forEach(p => {
+    const tId = p.teamId || p.teamID;
+    if (!teamStats[tId]) teamStats[tId] = { dmg: 0, gold: 0, taken: 0 };
+    teamStats[tId].dmg += p.totalDamageDealtToChampions || (p.damageStats ? p.damageStats.totalDamageDoneToChampions : 0) || 0;
+    teamStats[tId].gold += p.goldEarned || p.totalGold || p.currentGold || 0;
+    teamStats[tId].taken += p.totalDamageTaken || (p.damageStats ? p.damageStats.totalDamageTaken : 0) || 0;
+  });
+
+  return jogo.participants.map(p => {
+    const tId = p.teamId || p.teamID;
+    const summoner = p.riotIdGameName || p.summonerName || (p.riotId ? p.riotId.displayName : "Unknown");
+    const pId = p.participantId || p.participantID;
+
+    const kills12 = eventLines.filter(e => e.eventType === "CHAMPION_KILL" && (e.killerName === summoner || e.killerId === pId) && (e.gameTime || e.timestamp || 0) <= limit12).length;
+    const deaths12 = eventLines.filter(e => e.eventType === "CHAMPION_KILL" && (e.victimName === summoner || e.victimId === pId) && (e.gameTime || e.timestamp || 0) <= limit12).length;
+    const assists12 = eventLines.filter(e => e.eventType === "CHAMPION_KILL" && (e.assisters || []).includes(summoner) && (e.gameTime || e.timestamp || 0) <= limit12).length;
+    const wards12 = eventLines.filter(e => {
+        const isWard = e.rfc461Schema === "ward_placed" || e.type === "WARD_PLACED" || e.rfc461Schema === "ward_kill" || e.type === "WARD_KILL";
+        const isMine = e.placer?.toString() === pId.toString() || e.creatorId?.toString() === pId.toString() || e.killerId?.toString() === pId.toString();
+        const time = e.gameTime || e.timestamp || 0;
+        return isWard && isMine && time <= limit12;
+    }).length;
+
+    const dmg = p.totalDamageDealtToChampions || (p.damageStats ? p.damageStats.totalDamageDoneToChampions : 0) || 0;
+    const taken = p.totalDamageTaken || (p.damageStats ? p.damageStats.totalDamageTaken : 0) || 0;
+    const gold = p.goldEarned || p.totalGold || 0;
+    const minions = (p.totalMinionsKilled || p.minionsKilled || 0) + (p.neutralMinionsKilled || p.jungleMinionsKilled || 0);
+    
+    let isWin = p.win;
+    if (isWin === undefined && jogo.teams) {
+        const teamObj = jogo.teams.find(t => (t.teamId || t.teamID) === tId);
+        if (teamObj) isWin = teamObj.win;
+    }
+
+    let timestamp = jogo.gameStartTimestamp || jogo.gameCreation || Date.now();
+    if (isNaN(new Date(timestamp).getTime())) timestamp = Date.now();
+
+    return {
+      match_id: matchId, summoner_name: summoner, puuid: p.puuid || `${summoner}-${matchId}`, // Fallback if PUUID is missing
+      game_start_time: new Date(timestamp).toISOString(), patch: patch, 
+      team_acronym: teamMap[tId] || (tId === 100 ? "BLUE" : "RED"), side: tId === 100 ? 'Blue' : 'Red',
+      lane: p.lane || p.teamPosition || p.role || "UNKNOWN", champion: p.championName,
+      kda: toNum(p.challenges?.kda || (p.deaths ? (p.kills + p.assists) / p.deaths : (p.kills + p.assists))),
+      kills: p.kills || 0, deaths: p.deaths || 0, deaths_at_12: deaths12, assists: p.assists || 0,
+      result: isWin ? "Victory" : "Defeat", cs_6: dadosPorTempo[6]?.[pId]?.cs || 0, cs_12: dadosPorTempo[12]?.[pId]?.cs || 0, cs_18: dadosPorTempo[18]?.[pId]?.cs || 0, 
+      xp_12: dadosPorTempo[12]?.[pId]?.xp || 0, gold_12: dadosPorTempo[12]?.[pId]?.gold || 0,
+      vpm_at_12: toNum(wards12 / 12), kda_at_12: deaths12 > 0 ? toNum((kills12 + assists12) / deaths12) : kills12 + assists12,
+      vspm: toNum((p.visionScore || 0) / duracaoMinutos), cw_placed: p.detectorWardsPlaced || p.visionWardsBoughtInGame || 0,
+      dpm: toNum(dmg / duracaoMinutos), gpm: toNum(gold / duracaoMinutos), gold_efficiency: toNum(gold / duracaoMinutos / 4.5),
+      kp: toNum(p.challenges?.killParticipation), fpm: toNum(minions / duracaoMinutos),
+      dmg_buildings: p.damageDealtToBuildings || 0, dmg_objectives: p.damageDealtToObjectives || 0, plates: p.challenges?.turretPlatesTaken || 0,
+      dmg_percent: toNum(dmg / (teamStats[tId]?.dmg || 1)), taken_percent: toNum(taken / (teamStats[tId]?.taken || 1)), mitigated: p.totalDamageSelfMitigated || 0,
+      fb_assist: eventosChave[summoner]?.fbAssist || false, fb_kill: eventosChave[summoner]?.fbKill || false,
+      ft_assist: eventosChave[summoner]?.ftAssist || false, ft_kill: eventosChave[summoner]?.ftKill || false,
+      total_dmg: dmg, total_taken: taken, vision_score: p.visionScore || 0, wards_placed: p.wardsPlaced || 0, wards_killed: p.wardsKilled || 0,
+      total_gold: gold, win: isWin ? true : false, cc_score: p.timeCCingOthers || 0, gold_share: toNum(gold / (teamStats[tId]?.gold || 1))
+    };
+  });
+}
+
+function extrairWardsDB(eventLines, matchId, nameMap) {
+  const wards = [];
+  eventLines.forEach(e => {
+    if (e.rfc461Schema === "ward_placed" || e.type === "WARD_PLACED") {
+      const pid = e.placer?.toString() || e.creatorId?.toString();
+      wards.push({
+        match_id: matchId, player_name: nameMap[pid] || pid, minute: Math.floor((e.gameTime || e.timestamp || 0) / 60000),
+        type: e.wardType || "unknown", ward_x: toNum(e.position?.x), ward_y: toNum(e.position?.z || e.position?.y)
+      });
+    }
+  });
+  return wards;
+}
+
+function extrairObjetivosDB(eventLines, matchId, teamMap, nameMap) {
+  const objetivos = [];
+  let dragonCount = 0;
+  eventLines.forEach(e => {
+    if (e.eventType === "ELITE_MONSTER_KILL" || e.rfc461Schema === "epic_monster_kill" || e.type === "ELITE_MONSTER_KILL") {
+      const type = e.monsterType || e.epicMonsterType || "UNKNOWN";
+      let objName = type;
+      if (type === "DRAGON") { dragonCount++; objName = `dragon${dragonCount}`; }
+      const killerId = e.killerId || e.killerID;
+      let killerName = e.killerName;
+      if (!killerName && killerId && nameMap[killerId]) killerName = nameMap[killerId];
+
+      objetivos.push({
+        match_id: matchId, minuto: Math.floor((e.timestamp || e.gameTime || 0) / 60000),
+        team_acronym: teamMap[e.killerTeamId || e.teamId] || "N/A", objective_type: objName,
+        subtype: e.monsterSubType || e.epicMonsterSubType || "", player_name: killerName || "Team"
+      });
+    }
+  });
+  return objetivos;
+}
+
+function extrairDraftsDB(gridState, endStateRiot, realMatchId, teamMap, gameNum) {
+  const drafts = [];
+  if (!gridState?.seriesState?.games) return drafts;
+
+  const jogoNoGrid = gridState.seriesState.games[gameNum - 1];
+  if (!jogoNoGrid?.draftActions) return drafts;
+
+  const drafterSideMap = {};
+  if (jogoNoGrid.teams) {
+    jogoNoGrid.teams.forEach(t => {
+      drafterSideMap[t.id] = t.side ? t.side.charAt(0).toUpperCase() + t.side.slice(1).toLowerCase() : 'Unknown';
+    });
+  }
+
+  const champMap = {};
+  if (endStateRiot?.participants) {
+      endStateRiot.participants.forEach(p => {
+        const side = (p.teamId || p.teamID) === 100 ? 'Blue' : 'Red';
+        champMap[`${p.championName}_${side}`] = p.riotIdGameName || p.summonerName || (p.riotId ? p.riotId.displayName : "Unknown");
+      });
+  }
+
+  const actions = jogoNoGrid.draftActions || [];
+  actions.sort((a, b) => +(a.sequenceNumber || 0) - +(b.sequenceNumber || 0)).forEach(action => {
+    const seq = parseInt(action.sequenceNumber, 10) || 0;
+    const tipo = (action.type || "").toUpperCase();
+    const campeao = action.draftable?.name || 'Unknown';
+    const side = drafterSideMap[action.drafter?.id] || 'Unknown';
+    
+    drafts.push({
+      match_id: realMatchId, team_acronym: side === 'Blue' ? teamMap[100] : teamMap[200],
+      tipo: tipo, side: side, jogador: tipo === 'PICK' ? (champMap[`${campeao}_${side}`] || 'Team') : 'Team', champion: campeao, sequence: seq
+    });
+  });
+  return drafts;
+}
+
+// --- MOTOR DE RATINGS ---
 async function calculateRatings(players) {
   const { data: weights } = await supabase.from('lane_weights').select('*');
   const { data: bounds } = await supabase.from('lane_metrics_bounds').select('*');
@@ -93,12 +287,7 @@ async function calculateRatings(players) {
   });
 }
 
-// --- FUNÇÕES DE EXTRAÇÃO DE DADOS EM MEMÓRIA ---
-// Obs: As funções extrairEstatisticasDB, extrairDadosPorTempo, etc. ficam aqui, 
-// idênticas às que usamos no script anterior (o trator sem vazamento de RAM).
-// Por brevidade visual aqui no chat, assuma que elas estão coladas aqui exatamente 
-// como no código anterior, retornando os objetos { match_id, summoner_name, etc. }
-
+// --- ENGINE PRINCIPAL ---
 async function baixarZIPSeguro(url) {
   try {
     const res = await gridApiFiles.get(url, { responseType: 'arraybuffer' });
@@ -113,56 +302,139 @@ async function processarPartidaRecente(partida) {
     console.log(`\n⏳ Baixando ZIPs da Série [${seriesId}] - ${partida.campeonato}`);
 
     const zipRiot = await baixarZIPSeguro(`/end-state/riot/series/${seriesId}`);
-    if (!zipRiot) return; // Se não tem ZIP, a série não acabou ou não tem dados.
+    if (!zipRiot) return;
     await delay(1500); 
+    const zipDetails = await baixarZIPSeguro(`/end-state-details/riot/series/${seriesId}`);
+    await delay(1500); 
+    const zipEvents = await baixarZIPSeguro(`/events/riot/series/${seriesId}`);
+    await delay(1500); 
+    const zipGrid = await baixarZIPSeguro(`/end-state/grid/series/${seriesId}`);
+    await delay(1500);
+
+    const entradasRiot = zipRiot.getEntries();
     
-    // ... Aqui entra a lógica exata de ler os ZIPs em memória, extrair os times (uniqueTeamsMap), 
-    // jogadores (uniquePlayersMap) e matches do seu React, dar o .upsert() neles, 
-    // rodar os statsBrutos pelo calculateRatings(), e dar o insert final. 
-    // (A mesma lógica estruturada no final do código anterior).
-    console.log(`✅ Série ${seriesId} finalizada e salva no banco.`);
+    let gridState = null;
+    if (zipGrid && zipGrid.getEntries) {
+        const gridEntry = zipGrid.getEntries()[0];
+        if (gridEntry) gridState = JSON.parse(gridEntry.getData().toString('utf8'));
+    }
+
+    const { game_type, split } = formatTournamentDetails(partida.campeonato);
+
+    for (const entrada of entradasRiot) {
+        const matchRegex = entrada.entryName.match(/_(\d+)\.json$/);
+        if (!matchRegex) continue;
+        
+        const gameNum = matchRegex[1];
+        const realMatchId = `${seriesId}_${gameNum}`;
+
+        const { data: existe } = await supabase.from('matches').select('id').eq('id', realMatchId).maybeSingle();
+        if (existe) {
+             console.log(`⏩ Jogo ${realMatchId} já no BD. Pulando...`);
+             continue;
+        }
+
+        console.log(`▶️ Processando Jogo ${gameNum} (ID: ${realMatchId})...`);
+
+        const endState = JSON.parse(entrada.getData().toString('utf8'));
+
+        let lado_vencedor = 'unknown';
+        if (endState.teams) {
+            const winTeam = endState.teams.find(t => t.win === true || t.win === "Win");
+            if (winTeam) lado_vencedor = (winTeam.teamId || winTeam.teamID) === 100 ? 'blue' : 'red';
+        }
+
+        let detailsJson = null;
+        if (zipDetails && zipDetails.getEntries) {
+            const detEntry = zipDetails.getEntries().find(e => e.entryName.match(new RegExp(`_${gameNum}\\.json$`)));
+            if (detEntry) detailsJson = JSON.parse(detEntry.getData().toString('utf8'));
+        }
+
+        let eventLines = [];
+        if (zipEvents && zipEvents.getEntries) {
+            const evtEntry = zipEvents.getEntries().find(e => e.entryName.match(new RegExp(`_${gameNum}\\.jsonl?$`)));
+            if (evtEntry) eventLines = evtEntry.getData().toString('utf8').trim().split('\n').filter(l => l).map(l => JSON.parse(l));
+        }
+
+        const teamMap = {}; const nameMap = {};
+        const getAcronym = (tId) => {
+            const p = endState.participants.find(part => (part.teamId === tId || part.teamID === tId));
+            const nome = p ? (p.riotIdGameName || p.summonerName || (p.riotId ? p.riotId.displayName : "")) : "";
+            return (nome && nome.includes(' ')) ? nome.split(' ')[0] : (tId === 100 ? "BLUE" : "RED");
+        };
+        teamMap[100] = getAcronym(100); teamMap[200] = getAcronym(200);
+
+        endState.participants.forEach(p => { 
+            const pId = p.participantId || p.participantID;
+            nameMap[pId] = p.riotIdGameName || p.summonerName || (p.riotId ? p.riotId.displayName : "Unknown"); 
+        });
+
+        const patch = endState.gameVersion ? endState.gameVersion.split('.').slice(0,2).join('.') : "N/A";
+        let timestamp = endState.gameStartTimestamp || endState.gameCreation || Date.now();
+        if (isNaN(new Date(timestamp).getTime())) timestamp = Date.now();
+        const finalIsoDate = new Date(timestamp).toISOString();
+
+        // 1. Extrai Dados Brutos
+        const statsBrutos = extrairEstatisticasDB(endState, detailsJson, eventLines, realMatchId, teamMap, patch);
+        const wardsDB = extrairWardsDB(eventLines, realMatchId, nameMap);
+        const objetivosDB = extrairObjetivosDB(eventLines, realMatchId, teamMap, nameMap);
+        const draftsDB = extrairDraftsDB(gridState, endState, realMatchId, teamMap, parseInt(gameNum));
+
+        // 2. Extrai Times e Jogadores Únicos (Ignore Duplicates para não apagar fotos/logos)
+        const times = new Map();
+        const jogadores = new Map();
+        statsBrutos.forEach(s => {
+            if (s.team_acronym) times.set(s.team_acronym, { acronym: s.team_acronym, name: s.team_acronym });
+            if (s.puuid) jogadores.set(s.puuid, { puuid: s.puuid, nickname: s.summoner_name, team_acronym: s.team_acronym, primary_role: s.lane });
+        });
+        
+        await supabase.from('teams').upsert(Array.from(times.values()), { onConflict: 'acronym', ignoreDuplicates: true });
+        await supabase.from('players').upsert(Array.from(jogadores.values()), { onConflict: 'puuid', ignoreDuplicates: true });
+
+        // 3. Upsert Series e Match
+        await supabase.from('series').upsert({ id: seriesId, description: `${teamMap[100]} x ${teamMap[200]}` }, { onConflict: 'id' });
+        await supabase.from('matches').upsert({
+            id: realMatchId, series_id: seriesId, patch: patch, game_start_time: finalIsoDate, 
+            game_type: game_type, split: split, blue_team_tag: teamMap[100], red_team_tag: teamMap[200], winner_side: lado_vencedor
+        }, { onConflict: 'id' });
+
+        // 4. Calcula Ratings e Insere Dados Finais
+        const statsFinais = await calculateRatings(statsBrutos);
+        if (statsFinais.length > 0) await supabase.from('player_stats_detailed').upsert(statsFinais);
+        if (wardsDB.length > 0) await supabase.from('match_wards').insert(wardsDB);
+        if (objetivosDB.length > 0) await supabase.from('match_objectives').insert(objetivosDB);
+        if (draftsDB.length > 0) await supabase.from('match_drafts').insert(draftsDB);
+
+        console.log(`✅ Jogo ${realMatchId} injetado no Supabase com Sucesso!`);
+    }
 }
 
-// --- O NOVO RADAR DIÁRIO ---
+// --- RADAR DIÁRIO ---
 async function buscarEProcessarUltimas24h() {
   console.log(`\n🤖 LIGANDO RADAR DE EXTRAÇÃO DIÁRIA...`);
-  
-  // Calcula a data de ontem para hoje
   const ontem = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   
   const query = `
     query {
       allSeries(
         first: 50, 
-        filter: { 
-          titleId: 3, 
-          startTimeScheduled: { gte: "${ontem}" }
-        }, 
+        filter: { titleId: 3, startTimeScheduled: { gte: "${ontem}" } }, 
         orderBy: StartTimeScheduled, orderDirection: DESC
-      ) {
-        edges { node { id, tournament { name } } }
-      }
+      ) { edges { node { id, tournament { name } } } }
     }`;
 
   try {
     const res = await gridApiGraphQL.post('', { query });
     const partidas = res.data.data.allSeries.edges.map(e => ({ id: e.node.id, campeonato: e.node.tournament?.name || 'Geral' }));
-    
-    console.log(`📡 Encontradas ${partidas.length} partidas agendadas/jogadas nas últimas 24h.`);
+    console.log(`📡 Encontradas ${partidas.length} partidas nas últimas 24h.`);
     
     for (const p of partidas) {
-        // Checa se a série já está no banco para não reprocessar à toa
         const { data: existe } = await supabase.from('series').select('id').eq('id', p.id).maybeSingle();
-        if (!existe) {
-            await processarPartidaRecente(p);
-        } else {
-            console.log(`⏩ Série ${p.id} já existe no banco. Pulando.`);
-        }
+        if (!existe) await processarPartidaRecente(p);
+        else console.log(`⏩ Série ${p.id} já processada anteriormente.`);
     }
     console.log("\n🏁 EXECUÇÃO DIÁRIA CONCLUÍDA.");
-  } catch (err) {
-    console.error(`❌ Erro no Radar:`, err.message);
-  }
+  } catch (err) { console.error(`❌ Erro no Radar:`, err.message); }
 }
 
 buscarEProcessarUltimas24h();
