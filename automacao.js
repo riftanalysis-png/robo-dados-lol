@@ -294,7 +294,11 @@ async function baixarZIPSeguro(url) {
     const buffer = Buffer.from(res.data);
     if (buffer[0] === 0x50 && buffer[1] === 0x4B) return new AdmZip(buffer); 
     return null;
-  } catch (e) { return null; }
+  } catch (e) { 
+    // Agora o console avisa exatamente por que falhou (ex: 404, 403, 429)
+    console.log(`      ↳ ⚠️ Arquivo não disponível: ${e.response?.status || e.message}`);
+    return null; 
+  }
 }
 
 async function processarPartidaRecente(partida) {
@@ -412,13 +416,19 @@ async function processarPartidaRecente(partida) {
 // --- RADAR DIÁRIO ---
 async function buscarEProcessarUltimas24h() {
   console.log(`\n🤖 LIGANDO RADAR DE EXTRAÇÃO DIÁRIA...`);
+  
+  // Define a janela de tempo exata (de Ontem até Agora)
   const ontem = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const agora = new Date().toISOString(); 
   
   const query = `
     query {
       allSeries(
         first: 50, 
-        filter: { titleId: 3, startTimeScheduled: { gte: "${ontem}" } }, 
+        filter: { 
+          titleId: 3, 
+          startTimeScheduled: { gte: "${ontem}", lte: "${agora}" } 
+        }, 
         orderBy: StartTimeScheduled, orderDirection: DESC
       ) { edges { node { id, tournament { name } } } }
     }`;
@@ -426,7 +436,7 @@ async function buscarEProcessarUltimas24h() {
   try {
     const res = await gridApiGraphQL.post('', { query });
     const partidas = res.data.data.allSeries.edges.map(e => ({ id: e.node.id, campeonato: e.node.tournament?.name || 'Geral' }));
-    console.log(`📡 Encontradas ${partidas.length} partidas nas últimas 24h.`);
+    console.log(`📡 Encontradas ${partidas.length} partidas jogadas nas últimas 24h.`);
     
     for (const p of partidas) {
         const { data: existe } = await supabase.from('series').select('id').eq('id', p.id).maybeSingle();
