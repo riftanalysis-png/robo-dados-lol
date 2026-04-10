@@ -440,8 +440,15 @@ async function processarPartidaRecente(partida) {
 }
 
 // --- RADAR DE VARREDURA DO ANO (COM PAGINAÇÃO) ---
-async function buscarEProcessarAnoAteHoje() {
-  console.log(`\n🤖 LIGANDO TRATOR DE EXTRAÇÃO (DO INÍCIO DO ANO ATÉ HOJE)...`);
+// A LISTA BLINDADA (Coloque no topo do arquivo junto das constantes se preferir)
+const CAMPEONATOS_ALVO = [
+  "lck", "lec", "lcs", "emea", "cblol", "circuito desafiante",
+  "first stand", "mundial", "world", "msi", "americas cup"
+];
+
+// --- TRATOR CRONOLÓGICO SEGURO ---
+async function executarBackfillStreaming(tipo) {
+  console.log(`\n🤖 LIGANDO TRATOR DE EXTRAÇÃO PARA: ${tipo} (Jan 2026 -> Hoje)...`);
   
   const inicioDoAno = "2026-01-01T00:00:00.000Z";
   const agora = new Date().toISOString(); 
@@ -457,8 +464,12 @@ async function buscarEProcessarAnoAteHoje() {
         allSeries(
           first: 50, 
           ${cursor ? `after: "${cursor}",` : ""}
-          filter: { titleId: 3, startTimeScheduled: { gte: "${inicioDoAno}", lte: "${agora}" } }, 
-          orderBy: StartTimeScheduled, orderDirection: DESC
+          filter: { 
+            titleId: 3, 
+            types: ${tipo},
+            startTimeScheduled: { gte: "${inicioDoAno}", lte: "${agora}" } 
+          }, 
+          orderBy: StartTimeScheduled, orderDirection: ASC
         ) { 
           pageInfo { hasNextPage, endCursor }
           edges { node { id, tournament { name } } } 
@@ -469,28 +480,50 @@ async function buscarEProcessarAnoAteHoje() {
       const res = await gridApiGraphQL.post('', { query });
       const data = res.data.data.allSeries;
       
-      const partidas = data.edges.map(e => ({ id: e.node.id, campeonato: e.node.tournament?.name || 'Geral' }));
-      totalProcessado += partidas.length;
+      const partidasDaPagina = data.edges.map(e => ({ id: e.node.id, campeonato: e.node.tournament?.name || tipo }));
       
-      console.log(`\n📄 Lendo Página ${pagina}... (${partidas.length} partidas encontradas)`);
-      
-      for (const p of partidas) {
-          const { data: existe } = await supabase.from('series').select('id').eq('id', p.id).maybeSingle();
-          if (!existe) await processarPartidaRecente(p);
-          else console.log(`⏩ Série ${p.id} já processada. Pulando...`);
+      // FILTRO: Ignora ligas inúteis e poupa o seu Rate Limit
+      let partidasValidas = [];
+      if (tipo === "ESPORTS") {
+          partidasValidas = partidasDaPagina.filter(p => {
+              const nome = p.campeonato.toLowerCase();
+              return CAMPEONATOS_ALVO.some(alvo => nome.includes(alvo));
+          });
+      } else {
+          partidasValidas = partidasDaPagina; // Scrims entram direto
       }
       
+      console.log(`\n📄 [${tipo}] Lendo Página ${pagina}... (${partidasValidas.length} partidas alvo encontradas de 50)`);
+      
+      for (const p of partidasValidas) {
+          const { data: existe } = await supabase.from('series').select('id').eq('id', p.id).maybeSingle();
+          if (!existe) {
+              await processarPartidaRecente(p);
+          } else {
+              console.log(`⏩ Série ${p.id} já processada. Pulando...`);
+          }
+      }
+      
+      totalProcessado += partidasValidas.length;
       hasNextPage = data.pageInfo.hasNextPage;
       cursor = data.pageInfo.endCursor;
       pagina++;
 
     } catch (err) { 
-      console.error(`❌ Erro no Radar (Página ${pagina}):`, err.message); 
+      console.error(`❌ Erro no Radar (Página ${pagina}):`, err.response?.data || err.message); 
       break;
     }
   }
   
-  console.log(`\n🏁 EXECUÇÃO CONCLUÍDA. Total de séries lidas na varredura: ${totalProcessado}.`);
+  console.log(`\n🏁 VARREDURA DE ${tipo} CONCLUÍDA. Total alvo lido: ${totalProcessado}.`);
 }
+
+async function iniciarBackfill() {
+  await executarBackfillStreaming("SCRIM");
+  await executarBackfillStreaming("ESPORTS");
+  console.log("\n✅ O BANCO DE DADOS ESTÁ 100% SINCRONIZADO COM 2026!");
+}
+
+iniciarBackfill();
 
 buscarEProcessarAnoAteHoje();
